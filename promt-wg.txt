@@ -1,0 +1,635 @@
+ПРОМТ: развернуть WireGuard-сервер (в Docker) в максимально защищённом режиме
+=============================================================================
+Скопируйте этот текст в другой сессии/агенту на целевой системе (Debian/Ubuntu
+с systemd, root-доступ, публичный IPv4 + желательно IPv6). Агент должен
+выполнить шаги 0–9, создав файлы ровно с указанным содержимым.
+
+ЗАДАЧА
+------
+Поднять WireGuard-сервер как шлюз (полный туннель «сейчас», с возможностью
+split-tunnel через редактируемый список подсетей), в одном Docker-контейнере
+вместе с рекурсивным DNS (unbound), с фаерволом nftables + NAT на ХОСТЕ,
+генератором клиентов и скриптом полного отката.
+
+ПАРАМЕТРЫ (при необходимости замените)
+--------------------------------------
+- Порт WireGuard:      38471/udp (нестандартный)
+- SSH:                  22
+- VPN IPv4:             10.8.0.0/24   (сервер 10.8.0.1)
+- VPN IPv6:             fd42:8:8::/64 (сервер fd42:8:8::1)
+- DNS клиентам:         10.8.0.1, fd42:8:8::1 (unbound, только на wg0)
+- Пустой туннель:       да (0.0.0.0/0, ::/0 в allowed-ips.list)
+- Изоляция клиентов:    да (на сервере /32 и /128, forward wg0->wg0 запрещён)
+- Каталог проекта:      /root/wg-docker   (config/ — ключи и клиенты)
+- Скрипт отката:        /root/wg-rollback.sh ; бэкапы в /root/wg-backup/
+
+ВАЖНЫЕ ГРАБЛИ (проверено на практике — не наступайте повторно)
+--------------------------------------------------------------
+1. Docker daemon.json с "bridge": "none" ломает `docker build` (RUN-слои без
+   сети). Собирайте образ ТАК:  DOCKER_BUILDKIT=1 docker build --network=host ...
+2. Модуль ядра wireguard должен быть загружен на ХОСТЕ (modprobe wireguard);
+   контейнеру тогда не нужен SYS_MODULE, только NET_ADMIN.
+3. unbound роняет права до пользователя unbound и слушает порт 53. Поэтому
+   контейнеру нужны caps: NET_ADMIN, NET_BIND_SERVICE, SETUID, SETGID, CHOWN
+   (cap-drop ALL, дальше добавляем только эти).
+4. Каталог /config/unbound ДОЛЖЕН быть root:unbound 0770. Если chown -R, он
+   падает (root без DAC_OVERRIDE не читает чужой каталог 0700) — делайте
+   нерекурсивный chown самого каталога. root делает chdir, unbound пишет туда
+   root.key (DNSSEC trust anchor, bootstrap через unbound-anchor).
+5. Пакета qrencode в Alpine 3.20 нет — не добавляйте его в apk; QR в
+   gen-client.sh обёрнут в `|| true`.
+6. Хост с малым объёмом RAM: лимит контейнера --memory 192m --memory-swap 384m.
+7. Тест «клиент на том же хосте, что сервер» даёт ложный минус из-за конфликта
+   маршрута /32. Правильный тест — клиент в отдельном netns (см. шаг 9).
+
+ШАГ 0. РАЗВЕДКА
+---------------
+Проверить: `uname -r` (>=5.6), наличие модуля (`modinfo wireguard`),
+`/dev/net/tun`, `systemd-detect-virt`, имя WAN-интерфейса и публичный IP
+(`ip -brief addr`, `ip route show default`), свободную RAM/диск, занятость портов.
+Определить WAN_IF (в примерах eth0) и PUBLIC_IP.
+
+ШАГ 1. БЭКАП ОРИГИНАЛОВ И СКРИПТ ОТКАТА (ДЕЛАТЬ ПЕРВЫМ)
+-------------------------------------------------------
+Создать бэкап и скрипт отката ДО любых правок:
+
+    TS=$(date +%Y%m%d-%H%M%S); BK=/root/wg-backup/orig-$TS
+    mkdir -p "$BK"/{ssh,sysctl,modules-load,docker}
+    [ -f /etc/ssh/sshd_config ] && cp -a /etc/ssh/sshd_config "$BK/ssh/"
+    [ -d /etc/ssh/sshd_config.d ] && cp -a /etc/ssh/sshd_config.d "$BK/ssh/"
+    [ -f /etc/resolv.conf ] && cp -a /etc/resolv.conf "$BK/"
+    [ -f /etc/nftables.conf ] && cp -a /etc/nftables.conf "$BK/"
+    cp -a /etc/sysctl.d/. "$BK/sysctl/" 2>/dev/null || true
+    cp -a /etc/modules-load.d/. "$BK/modules-load/" 2>/dev/null || true
+    [ -f /etc/docker/daemon.json ] && cp -a /etc/docker/daemon.json "$BK/docker/"
+    ss -tulpn > "$BK/listening-ports.txt" 2>/dev/null || true
+    nft list ruleset > "$BK/nft-ruleset-before.txt" 2>/dev/null || true
+    echo "$TS" > /root/wg-backup/LAST_ORIG_TS
+
+Создать /root/wg-rollback.sh со следующим содержимым (chmod 700):
+
+---8<--- /root/wg-rollback.sh ---8<---
+#!/usr/bin/env bash
+#
+# wg-rollback.sh — полный откат WireGuard-in-Docker установки.
+# Переносит конфиги и ключи в ~/wg-backup/rollback-<timestamp>/, возвращает
+# хостовые настройки (nftables, sysctl, SSH, Docker) к состоянию из
+# последнего бэкапа ~/wg-backup/orig-*/.
+#
+# Использование:
+#   /root/wg-rollback.sh [--yes] [--purge-image] [--purge-docker]
+#
+set -euo pipefail
+
+CONTAINER="wg"
+IMAGE="wg-server:latest"
+WG_DIR="/root/wg-docker"
+BACKUP_ROOT="/root/wg-backup"
+NFT_CONF="/etc/nftables.conf"
+SYSCTL_FILE="/etc/sysctl.d/99-wireguard.conf"
+MODLOAD_FILE="/etc/modules-load.d/wireguard.conf"
+DOCKER_DAEMON="/etc/docker/daemon.json"
+SSHD_DROPIN="/etc/ssh/sshd_config.d/10-wg-port.conf"
+
+ASSUME_YES=0; PURGE_IMAGE=0; PURGE_DOCKER=0
+for arg in "$@"; do
+  case "$arg" in
+    --yes) ASSUME_YES=1 ;; --purge-image) PURGE_IMAGE=1 ;;
+    --purge-docker) PURGE_DOCKER=1 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) echo "Неизвестный аргумент: $arg" >&2; exit 1 ;;
+  esac
+done
+log(){ printf '\033[1;34m[*]\033[0m %s\n' "$*"; }
+ok(){  printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
+warn(){ printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
+[ "$(id -u)" -eq 0 ] || { echo "Запускать нужно от root." >&2; exit 1; }
+ORIG="$(ls -1d "$BACKUP_ROOT"/orig-* 2>/dev/null | sort | tail -1 || true)"
+[ -n "${ORIG:-}" ] && log "Оригиналы: $ORIG" || warn "Нет $BACKUP_ROOT/orig-*"
+TS="$(date +%Y%m%d-%H%M%S)"; ROLLBACK_DIR="$BACKUP_ROOT/rollback-$TS"
+if [ "$ASSUME_YES" -ne 1 ]; then
+  warn "Полный откат. Конфиги и ключи будут перенесены в: $ROLLBACK_DIR"
+  read -r -p "Продолжить? [y/N] " ans
+  case "$ans" in y|Y|yes|YES) ;; *) echo "Отменено."; exit 0 ;; esac
+fi
+mkdir -p "$ROLLBACK_DIR"
+if command -v docker >/dev/null 2>&1; then
+  docker inspect "$CONTAINER" >/dev/null 2>&1 && {
+    docker stop "$CONTAINER" >/dev/null 2>&1 || true
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; } || log "Нет контейнера $CONTAINER"
+  [ "$PURGE_IMAGE" -eq 1 ] && { docker rmi "$IMAGE" >/dev/null 2>&1 || true; }
+fi
+if [ -n "${ORIG:-}" ] && [ -f "$ORIG/nftables.conf" ]; then cp -a "$ORIG/nftables.conf" "$NFT_CONF"
+elif [ ! -f "$NFT_CONF" ]; then printf '#!/usr/sbin/nft -f\nflush ruleset\n' > "$NFT_CONF"; fi
+nft flush ruleset 2>/dev/null || true
+[ -f "$NFT_CONF" ] && nft -f "$NFT_CONF" 2>/dev/null || true
+systemctl list-unit-files 2>/dev/null | grep -q '^nftables.service' && systemctl disable --now nftables >/dev/null 2>&1 || true
+if [ -n "${ORIG:-}" ] && [ -f "$ORIG/docker/daemon.json" ]; then
+  mkdir -p /etc/docker; cp -a "$ORIG/docker/daemon.json" "$DOCKER_DAEMON"
+elif [ -f "$DOCKER_DAEMON" ]; then rm -f "$DOCKER_DAEMON"; fi
+rm -f "$SSHD_DROPIN"
+[ -n "${ORIG:-}" ] && [ -d "$ORIG/ssh/sshd_config.d" ] && cp -a "$ORIG/ssh/sshd_config.d/." /etc/ssh/sshd_config.d/ 2>/dev/null || true
+[ -n "${ORIG:-}" ] && [ -f "$ORIG/ssh/sshd_config" ] && cp -a "$ORIG/ssh/sshd_config" /etc/ssh/sshd_config || true
+sshd -t >/dev/null 2>&1 && { systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true; }
+rm -f "$SYSCTL_FILE"
+[ -n "${ORIG:-}" ] && [ -d "$ORIG/sysctl" ] && cp -a "$ORIG/sysctl/." /etc/sysctl.d/ 2>/dev/null || true
+sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.all.forwarding=0 >/dev/null 2>&1 || true
+sysctl --system >/dev/null 2>&1 || true
+rm -f "$MODLOAD_FILE"
+if [ -d "$WG_DIR" ]; then cp -a "$WG_DIR" "$ROLLBACK_DIR/"; rm -rf "$WG_DIR"; fi
+[ -d /etc/wireguard ] && { cp -a /etc/wireguard "$ROLLBACK_DIR/etc-wireguard"; rm -rf /etc/wireguard; }
+if [ "$PURGE_DOCKER" -eq 1 ] && dpkg -s docker.io >/dev/null 2>&1; then
+  systemctl disable --now docker >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y docker.io containerd >/dev/null 2>&1 || true
+  apt-get autoremove -y >/dev/null 2>&1 || true; rm -rf /var/lib/docker /etc/docker
+fi
+ok "Откат завершён."; echo "  Бэкап: $ROLLBACK_DIR"
+---8<--- конец /root/wg-rollback.sh ---8<---
+
+ШАГ 2. DOCKER
+-------------
+    apt-get update && apt-get install -y docker.io
+    cat > /etc/docker/daemon.json <<'EOF'
+    {
+      "iptables": false,
+      "ip-forward": false,
+      "bridge": "none",
+      "log-driver": "json-file",
+      "log-opts": { "max-size": "10m", "max-file": "3" }
+    }
+    EOF
+    systemctl enable --now docker
+
+(«iptables»:false — чтобы Docker не трогал наш nftables; «bridge»:none — нет
+docker0; сборка образа это учитывает через --network=host.)
+
+ШАГ 3. МОДУЛЬ ЯДРА
+------------------
+    modprobe wireguard
+    printf 'wireguard\n' > /etc/modules-load.d/wireguard.conf
+    lsmod | grep wireguard || echo "ПРОБЛЕМА: модуль не загрузился"
+
+ШАГ 4. ФАЙЛЫ ПРОЕКТА в /root/wg-docker/
+----------------------------------------
+Создать каталоги: mkdir -p /root/wg-docker/config/clients
+
+----- Dockerfile -----
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+      wireguard-tools \
+      iproute2 \
+      unbound \
+      bash \
+      tini \
+      ca-certificates \
+ && rm -rf /var/cache/apk/*
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY gen-client.sh /usr/local/bin/gen-client.sh
+COPY unbound.conf.default /usr/local/share/unbound.conf.default
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/gen-client.sh
+
+VOLUME ["/config"]
+EXPOSE 38471/udp
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD wg show wg0 >/dev/null 2>&1 || exit 1
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+
+----- entrypoint.sh -----
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+CONFIG="${CONFIG_DIR:-/config}"
+UNBOUND_DIR="$CONFIG/unbound"
+PORT="${WG_PORT:-38471}"
+ADDR4="${WG_ADDR4:-10.8.0.1/24}"
+ADDR6="${WG_ADDR6:-fd42:8:8::1/64}"
+MTU="${WG_MTU:-1420}"
+
+mkdir -p "$CONFIG/clients" "$UNBOUND_DIR"
+
+if [ ! -s "$CONFIG/server.key" ]; then wg genkey > "$CONFIG/server.key"; fi
+chmod 600 "$CONFIG/server.key"
+wg pubkey < "$CONFIG/server.key" > "$CONFIG/server.pub"
+chmod 600 "$CONFIG/server.pub"
+
+if [ ! -s "$CONFIG/wg0.conf" ]; then
+  cat > "$CONFIG/wg0.conf" <<EOF
+[Interface]
+PrivateKey = $(cat "$CONFIG/server.key")
+ListenPort = $PORT
+EOF
+fi
+chmod 600 "$CONFIG/wg0.conf"
+
+if [ ! -s "$CONFIG/unbound.conf" ]; then
+  cp /usr/local/share/unbound.conf.default "$CONFIG/unbound.conf"
+fi
+chown root:unbound "$UNBOUND_DIR" 2>/dev/null || true
+chmod 0770 "$UNBOUND_DIR" 2>/dev/null || true
+if [ ! -s "$UNBOUND_DIR/root.key" ]; then
+  unbound-anchor -a "$UNBOUND_DIR/root.key" >/dev/null 2>&1 || true
+  chown root:unbound "$UNBOUND_DIR/root.key" 2>/dev/null || true
+  chmod 0660 "$UNBOUND_DIR/root.key" 2>/dev/null || true
+fi
+
+if [ ! -s "$CONFIG/endpoint" ]; then
+  EP="$PORT"; HOST="${WG_ENDPOINT:-}"
+  if [ -z "$HOST" ]; then
+    HOST="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)"
+  fi
+  [ -n "$HOST" ] && echo "$HOST:$EP" > "$CONFIG/endpoint"
+fi
+
+ip link del wg0 2>/dev/null || true
+ip link add wg0 type wireguard
+wg setconf wg0 "$CONFIG/wg0.conf"
+ip -4 addr add "$ADDR4" dev wg0 2>/dev/null || true
+ip -6 addr add "$ADDR6" dev wg0 2>/dev/null || true
+ip link set wg0 mtu "$MTU"
+ip link set wg0 up
+
+UNBOUND_PID=""
+cleanup() {
+  echo "[entrypoint] завершение, останавливаю unbound и удаляю wg0..."
+  [ -n "$UNBOUND_PID" ] && kill "$UNBOUND_PID" 2>/dev/null || true
+  wg show wg0 >/dev/null 2>&1 && ip link del wg0 2>/dev/null || true
+}
+trap cleanup TERM INT EXIT
+
+unbound -d -c "$CONFIG/unbound.conf" &
+UNBOUND_PID=$!
+echo "[entrypoint] unbound pid=$UNBOUND_PID"
+echo "[entrypoint] wg0 поднят: $(wg show wg0 | head -1)"
+wait -n "$UNBOUND_PID"
+
+----- gen-client.sh -----
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+CONFIG="${CONFIG_DIR:-/config}"
+PORT="${WG_PORT:-38471}"
+name="${1:-}"
+[ -z "$name" ] && { echo "Использование: gen-client.sh <name>" >&2; exit 1; }
+[[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Недопустимое имя: $name" >&2; exit 1; }
+
+cdir="$CONFIG/clients/$name"
+[ -d "$cdir" ] && { echo "Клиент '$name' уже существует" >&2; exit 1; }
+mkdir -p "$cdir"
+
+wg genkey > "$cdir/priv.key"
+wg pubkey < "$cdir/priv.key" > "$cdir/pub.key"
+wg genpsk > "$cdir/psk.key"
+chmod 600 "$cdir"/*.key
+
+used="$(awk -F'[=,/ ]+' '
+  /^AllowedIPs/ { for (i=1;i<=NF;i++)
+      if ($i ~ /^10\.8\.0\.[0-9]+$/) { split($i,a,"."); print a[4] } }
+' "$CONFIG/wg0.conf" 2>/dev/null | sort -n | uniq || true)"
+idx=2
+while printf '%s\n' "$used" | grep -qx "$idx"; do idx=$((idx + 1)); done
+
+cat >> "$CONFIG/wg0.conf" <<EOF
+
+[Peer]
+# $name
+PublicKey = $(cat "$cdir/pub.key")
+PresharedKey = $(cat "$cdir/psk.key")
+AllowedIPs = 10.8.0.$idx/32, fd42:8:8::$idx/128
+EOF
+
+allowed=""
+if [ -f "$CONFIG/allowed-ips.list" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"; line="$(printf '%s' "$line" | tr -d '[:space:]')"
+    [ -z "$line" ] && continue
+    allowed="$allowed, $line"
+  done < "$CONFIG/allowed-ips.list"
+fi
+allowed="10.8.0.0/24, fd42:8:8::/64${allowed}"
+endpoint="$(cat "$CONFIG/endpoint" 2>/dev/null || echo "REPLACE_WITH_SERVER_IP:$PORT")"
+
+conf="$cdir/$name.conf"
+cat > "$conf" <<EOF
+[Interface]
+PrivateKey = $(cat "$cdir/priv.key")
+Address = 10.8.0.$idx/24, fd42:8:8::$idx/64
+DNS = 10.8.0.1, fd42:8:8::1
+MTU = 1420
+
+[Peer]
+PublicKey = $(cat "$CONFIG/server.pub")
+PresharedKey = $(cat "$cdir/psk.key")
+Endpoint = $endpoint
+AllowedIPs =$allowed
+PersistentKeepalive = 25
+EOF
+chmod 600 "$conf"
+
+if wg show wg0 >/dev/null 2>&1; then
+  wg syncconf wg0 <(grep -v '^#' "$CONFIG/wg0.conf")
+fi
+
+qrencode -t ansiutf8 < "$conf" > "$cdir/$name.qr.txt" 2>/dev/null || true
+qrencode -o "$cdir/$name.png" < "$conf" 2>/dev/null || true
+
+echo "Клиент '$name' создан:"
+echo "  адрес:    10.8.0.$idx, fd42:8:8::$idx"
+echo "  конфиг:   $conf"
+[ -f "$cdir/$name.png" ] && echo "  QR (png): $cdir/$name.png"
+echo
+cat "$cdir/$name.qr.txt" 2>/dev/null || true
+
+----- unbound.conf.default -----
+# unbound для WireGuard-туннеля. Слушает ТОЛЬКО адреса wg0.
+server:
+  verbosity: 1
+  interface: 10.8.0.1
+  interface: fd42:8:8::1
+  port: 53
+  do-ip4: yes
+  do-ip6: yes
+  do-udp: yes
+  do-tcp: yes
+
+  access-control: 10.8.0.0/24 allow
+  access-control: fd42:8:8::/64 allow
+  access-control: 127.0.0.0/8 allow
+  access-control: ::1 allow
+  access-control: 0.0.0.0/0 refuse
+  access-control: ::/0 refuse
+
+  auto-trust-anchor-file: "/config/unbound/root.key"
+  harden-dnssec-stripped: yes
+  harden-glue: yes
+  qname-minimisation: yes
+  hide-identity: yes
+  hide-version: yes
+  prefetch: yes
+  rrset-roundrobin: yes
+
+  username: "unbound"
+  directory: "/config/unbound"
+  chroot: ""
+  do-daemonize: no
+  use-syslog: no
+  logfile: ""
+
+  msg-cache-size: 4m
+  rrset-cache-size: 8m
+  cache-min-ttl: 60
+  cache-max-ttl: 86400
+  num-threads: 1
+  so-reuseport: yes
+  minimal-responses: yes
+
+----- config/allowed-ips.list -----
+# Подсети, которые клиенты маршрутизируют в туннель (AllowedIPs).
+# Одна запись CIDR на строку, '#' — комментарий.
+# Сейчас — весь трафик. Для split-tunnel удалите 0.0.0.0/0 и ::/0,
+# перечислите нужные подсети и ПЕРЕВЫПУСТИТЕ клиентов (gen-client.sh).
+0.0.0.0/0
+::/0
+
+----- up.sh -----
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+IMAGE="wg-server:latest"; CONTAINER="wg"
+CONFIG_DIR="${CONFIG_DIR:-$(pwd)/config}"
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  DOCKER_BUILDKIT=1 docker build --network=host -t "$IMAGE" .
+fi
+docker inspect "$CONTAINER" >/dev/null 2>&1 && docker rm -f "$CONTAINER" >/dev/null
+docker run -d --name "$CONTAINER" \
+  --network host \
+  --cap-drop ALL \
+  --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE \
+  --cap-add SETUID --cap-add SETGID --cap-add CHOWN \
+  --security-opt no-new-privileges:true \
+  --read-only \
+  --tmpfs /run:rw,noexec,nosuid,size=8m \
+  --tmpfs /tmp:rw,noexec,nosuid,size=8m \
+  -v "$CONFIG_DIR":/config:rw \
+  --pids-limit 128 \
+  --memory 192m --memory-swap 384m \
+  --restart unless-stopped \
+  "$IMAGE"
+sleep 5
+docker ps --filter "name=^${CONTAINER}$" --format '{{.Names}}  {{.Status}}'
+docker logs "$CONTAINER" 2>&1 | tail -8
+
+Права: chmod 755 на *.sh в /root/wg-docker. Не забыть: пакет qrencode НЕ ставить.
+
+ШАГ 5. СБОРКА И ЗАПУСК
+----------------------
+    cd /root/wg-docker
+    DOCKER_BUILDKIT=1 docker build --network=host -t wg-server:latest .
+    ./up.sh
+    docker logs wg | tail
+    docker exec wg wg show
+
+ШАГ 6. ХОСТ: sysctl, SSH, nftables
+----------------------------------
+/etc/sysctl.d/99-wireguard.conf:
+    net.ipv4.ip_forward = 1
+    net.ipv6.conf.all.forwarding = 1
+    net.ipv4.conf.all.rp_filter = 2
+    net.ipv4.conf.default.rp_filter = 2
+    net.ipv4.conf.all.accept_redirects = 0
+    net.ipv4.conf.default.accept_redirects = 0
+    net.ipv4.conf.all.send_redirects = 0
+    net.ipv4.conf.default.send_redirects = 0
+    net.ipv4.conf.all.accept_source_route = 0
+    net.ipv4.conf.default.accept_source_route = 0
+    net.ipv6.conf.all.accept_redirects = 0
+    net.ipv6.conf.default.accept_redirects = 0
+    net.ipv6.conf.all.accept_source_route = 0
+    net.ipv6.conf.default.accept_source_route = 0
+    net.ipv4.tcp_syncookies = 1
+Применить: sysctl --system
+
+/etc/ssh/sshd_config.d/10-wg-port.conf:
+    Port 22
+    Port 8222
+Затем: sshd -t && systemctl reload ssh
+(После проверки входа по 8222 — убрать "Port 22" и порт 22 из nftables.)
+
+/etc/nftables.conf (заменить WAN если не eth0):
+    #!/usr/sbin/nft -f
+    flush ruleset
+    define WG_PORT = 38471
+    define WAN     = "eth0"
+    define WG      = "wg0"
+    define VPN4    = 10.8.0.0/24
+    define VPN6    = fd42:8:8::/64
+    table inet filter {
+        chain input {
+            type filter hook input priority filter; policy drop;
+            # счётчик всего входящего из туннеля
+            iifname $WG counter comment "wg0-in"
+            ct state established,related accept
+            iif lo accept
+            ip protocol icmp accept
+            meta l4proto ipv6-icmp accept
+            tcp dport { 22, 8222 } accept
+            udp dport $WG_PORT counter accept comment "wg-udp-in"
+            iifname $WG udp dport 53 counter accept
+            iifname $WG tcp dport 53 counter accept
+            log prefix "nft-drop-INPUT: " limit rate 5/minute
+            counter
+        }
+        chain forward {
+            type filter hook forward priority filter; policy drop;
+            ct state established,related accept
+            # лог новых соединений из туннеля + счётчик ушедшего трафика
+            iifname $WG oifname $WAN ct state new log prefix "wg-fwd-new: " limit rate 10/minute
+            iifname $WG oifname $WAN counter accept comment "wg0->wan"
+            log prefix "nft-drop-FORWARD: " limit rate 5/minute
+            counter
+        }
+        chain output { type filter hook output priority filter; policy accept; }
+    }
+    table ip nat {
+        chain postrouting {
+            type nat hook postrouting priority srcnat; policy accept;
+            oifname $WAN ip saddr $VPN4 masquerade
+        }
+    }
+    table ip6 nat {
+        chain postrouting {
+            type nat hook postrouting priority srcnat; policy accept;
+            oifname $WAN ip6 saddr $VPN6 masquerade
+        }
+    }
+Применить: nft -c -f /etc/nftables.conf && nft -f /etc/nftables.conf
+          systemctl enable nftables
+
+ШАГ 7. ГЕНЕРАЦИЯ КЛИЕНТА
+------------------------
+    docker exec wg gen-client.sh <имя>
+    cat /root/wg-docker/config/clients/<имя>/<имя>.conf
+Peer автоматически добавляется в сервер и применяется (wg syncconf).
+
+ШАГ 8. ПРОВЕРКА
+---------------
+- docker ps: контейнер healthy; docker exec wg wg show — listening port и peer.
+- DNS: docker exec wg nslookup example.com 10.8.0.1
+- SSH: баннер на 8222 (локально), внешний скан: открыты только 8222/tcp и
+  WG_PORT/udp, остальное — drop с логами (journalctl -k | grep nft-drop).
+- Изоляция: клиент A не пингует клиента B.
+- Счётчики туннеля: nft list chain inet filter input | grep -E 'wg0-in|udp dport 53'
+  и nft list chain inet filter forward | grep 'wg0->wan'. Если handshake есть, а
+  wg0-in/wg0->wan = 0 — клиент не шлёт прикладной трафик (частый случай у Xray:
+  не задан address == peer AllowedIPs, см. ШАГ 11).
+- Подробное логирование для отладки: в /root/wg-docker/config/unbound.conf
+  поставить `verbosity: 2` и `log-queries: yes`, затем `docker restart wg`;
+  логи — `docker logs -f wg`. После отладки вернуть `verbosity: 1` и убрать
+  `log-queries`.
+
+ШАГ 9. КОРРЕКТНЫЙ ТЕСТ «КЛИЕНТ» (без второго устройства)
+-------------------------------------------------------
+Клиент и сервер на одном хосте конфликтуют маршрутом /32 — тестировать в
+отдельном netns (нужен --privileged для тестового контейнера):
+
+    PRIV=$(cat .../clients/<имя>/priv.key); PSK=$(...psk.key); SPUB=$(cat .../server.pub)
+    docker run --rm --network host --privileged -e PRIV -e PSK -e SPUB \
+      --entrypoint sh wg-server:latest -c '
+      NS=wgtestns; cleanup(){ ip netns del $NS 2>/dev/null; ip link del veth-h 2>/dev/null; }
+      trap cleanup EXIT
+      ip netns add $NS
+      ip link add veth-h type veth peer name veth-c
+      ip link set veth-c netns $NS
+      ip addr add 192.168.99.1/24 dev veth-h; ip link set veth-h up
+      ip -n $NS addr add 192.168.99.2/24 dev veth-c; ip -n $NS link set veth-c up
+      ip -n $NS link set lo up
+      umask 077; printf "%s" "$PRIV">/tmp/priv; printf "%s" "$PSK">/tmp/psk
+      ip -n $NS link add wgtest type wireguard
+      ip netns exec $NS wg set wgtest private-key /tmp/priv peer "$SPUB" preshared-key /tmp/psk \
+        endpoint <PUBLIC_IP>:38471 allowed-ips 0.0.0.0/0,::/0 persistent-keepalive 25
+      ip -n $NS addr add 10.8.0.2/32 dev wgtest
+      ip -n $NS -6 addr add fd42:8:8::2/128 dev wgtest
+      ip -n $NS link set wgtest up
+      ip -n $NS route add <PUBLIC_IP>/32 via 192.168.99.1 dev veth-c
+      ip -n $NS route add default dev wgtest
+      ip -n $NS -6 route add default dev wgtest
+      sleep 3
+      ip netns exec $NS wg show wgtest | grep handshake
+      ip netns exec $NS ping -c2 1.1.1.1
+      ip netns exec $NS wget -T8 -qO- https://1.1.1.1/cdn-cgi/trace | head -4   # ip=<PUBLIC_IP>
+      '
+
+ШАГ 10. ОТКАТ
+-------------
+    /root/wg-rollback.sh            # интерактивно; конфиги/ключи -> ~/wg-backup/rollback-<ts>/
+    /root/wg-rollback.sh --yes --purge-image [--purge-docker]
+
+ШАГ 11. КЛИЕНТ XRAY-CORE (WireGuard outbound)
+---------------------------------------------
+Xray-core (v1.8.6+) умеет WireGuard как userspace-outbound. Тогда это «режим
+прокси»: Xray поднимает локальный SOCKS/HTTP, а в туннель уходит только тот
+трафик, который Xray туда направил. Браузер должен ходить через этот прокси.
+
+КРИТИЧНЫЕ ГРАБЛИ (симптом: handshake есть, но на сервере forward=0 и тишина):
+  * address ОБЯЗАН совпадать с AllowedIPs клиента на сервере: 10.8.0.2/32
+    (и fd42:8:8::2/128). Без address Xray берёт дефолт 10.0.0.1 — сервер
+    молча отбрасывает все внутренние пакеты (handshake при этом проходит!).
+  * remoteDNS обязателен, иначе домены не резолвятся внутри туннеля:
+    remoteDNS = ["10.8.0.1", "fd42:8:8::1"].
+  * preSharedKey должен совпадать с серверным PSK клиента.
+  * Браузер/система должны быть настроены на локальный прокси Xray.
+
+Пример конфига Xray (подставить ключи и address конкретного клиента):
+
+    {
+      "log": { "loglevel": "warning" },
+      "inbounds": [
+        { "tag": "socks", "listen": "127.0.0.1", "port": 10808,
+          "protocol": "socks", "settings": { "udp": true } },
+        { "tag": "http",  "listen": "127.0.0.1", "port": 10809, "protocol": "http" }
+      ],
+      "outbounds": [
+        {
+          "tag": "wg",
+          "protocol": "wireguard",
+          "settings": {
+            "secretKey": "<CLIENT_PRIVATE_KEY>",
+            "address": ["10.8.0.2/32", "fd42:8:8::2/128"],
+            "mtu": 1420,
+            "noKernelTun": true,
+            "remoteDNS": ["10.8.0.1", "fd42:8:8::1"],
+            "peers": [
+              {
+                "endpoint": "<PUBLIC_IP>:38471",
+                "publicKey": "<SERVER_PUBLIC_KEY>",
+                "preSharedKey": "<CLIENT_PSK>",
+                "allowedIPs": ["0.0.0.0/0", "::/0"],
+                "keepAlive": 25
+              }
+            ]
+          }
+        }
+      ],
+      "routing": {
+        "domainStrategy": "AsIs",
+        "rules": [ { "type": "field", "network": "tcp,udp", "outboundTag": "wg" } ]
+      }
+    }
+
+Значения берутся из config/clients/<имя>/: priv.key, psk.key, server.pub,
+endpoint. Браузер -> SOCKS 127.0.0.1:10808 или HTTP 127.0.0.1:10809.
+Проверка: на сервере растут счётчики wg0-in / wg0->wan и появляются строки
+wg-fwd-new в journalctl -k.
+
+ОЖИДАЕМЫЙ РЕЗУЛЬТАТ
+-------------------
+Контейнер wg (healthy) поднимает wg0 (kernel WireGuard) и unbound; хост
+форвардит трафик клиентов в интернет через NAT44/NAT66; наружу открыты только
+SSH 8222/tcp и WG_PORT/udp; DNS только внутри туннеля; клиенты изолированы;
+полный откат одной командой с сохранением всех ключей.

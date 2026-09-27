@@ -1,0 +1,32 @@
+# Секреты и рантайм: НИКОГДА не коммитить.
+# Пути даны относительно корня репозитория (deja-wg/).
+
+# Ключи сервера и серверный конфиг (содержит PrivateKey)
+docker/config/server.key
+docker/config/server.pub
+docker/config/wg0.conf
+docker/config/endpoint
+
+# Клиенты: ключи и конфиги
+docker/config/clients/
+
+# Сгенерированные unbound-конфиг и trust anchor
+docker/config/unbound.conf
+docker/config/unbound/
+
+# Любые ключи/секреты/бэкапы, где бы ни лежали
+*.key
+*.pub
+*.pem
+*.psk
+*.conf.bak*
+*.bak
+
+# Рантайм на сервере (если каталог склонируют как /root/wg-docker)
+config/clients/
+config/wg0.conf
+config/server.key
+config/server.pub
+config/endpoint
+config/unbound.conf
+config/unbound/
