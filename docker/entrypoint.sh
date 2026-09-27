@@ -15,23 +15,10 @@ MTU="${WG_MTU:-1420}"
 
 mkdir -p "$CONFIG/clients" "$UNBOUND_DIR"
 
-# --- 1. Ключи сервера --------------------------------------------------------
-if [ ! -s "$CONFIG/server.key" ]; then
-  wg genkey > "$CONFIG/server.key"
-fi
-chmod 600 "$CONFIG/server.key"
-wg pubkey < "$CONFIG/server.key" > "$CONFIG/server.pub"
-chmod 600 "$CONFIG/server.pub"
-
-# --- 2. Конфиг wg0 (чистый формат wg setconf: только Interface + Peer) -------
-if [ ! -s "$CONFIG/wg0.conf" ]; then
-  cat > "$CONFIG/wg0.conf" <<EOF
-[Interface]
-PrivateKey = $(cat "$CONFIG/server.key")
-ListenPort = $PORT
-EOF
-fi
-chmod 600 "$CONFIG/wg0.conf"
+# --- 1-2. Ключи сервера и wg0.conf (см. gen-server.sh) -----------------------
+# gen-server.sh идемпотентен: если ключ уже есть — просто поддерживает wg0.conf
+# в актуальном состоянии, сохраняя существующих peer'ов.
+gen-server.sh
 
 # --- 3. Конфиг unbound -------------------------------------------------------
 if [ ! -s "$CONFIG/unbound.conf" ]; then

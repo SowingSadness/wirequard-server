@@ -333,6 +333,10 @@ docker logs -f wg | grep -Ei 'query|reply'
 # выпустить нового клиента
 docker exec wg gen-client.sh <имя>
 
+# ключи сервера: создать/поддерживать wg0.conf (идемпотентно, клиенты сохраняются)
+docker exec wg gen-server.sh
+docker exec wg gen-server.sh --force   # перегенерировать ключ сервера (разорвёт клиентов!)
+
 # посмотреть серверные peer'ы
 docker exec wg wg show
 

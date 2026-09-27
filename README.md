@@ -17,6 +17,7 @@ deja-wg/
 ├── docker/
 │   ├── Dockerfile
 │   ├── entrypoint.sh       # поднимает wg0 (kernel) + unbound
+│   ├── gen-server.sh       # генерация ключей сервера (идемпотентно)
 │   ├── gen-client.sh       # генератор клиентов
 │   ├── unbound.conf.default
 │   ├── up.sh               # сборка + запуск с усиленными флагами
@@ -40,7 +41,8 @@ deja-wg/
 | `unbound.conf`, `unbound/root.key` | генерируются при первом запуске |
 
 Все они создаются автоматически:
-- `entrypoint.sh` — ключи сервера, `wg0.conf`, `unbound.conf`;
+- `gen-server.sh` — ключи сервера и `wg0.conf` (вызывается из `entrypoint.sh`);
+- `entrypoint.sh` — поднимает `wg0` и генерирует `unbound.conf`;
 - `gen-client.sh` — ключи клиента, PSK и `<имя>.conf`.
 
 ## Развёртывание на новом сервере
@@ -56,7 +58,9 @@ deja-wg/
 2. `modprobe wireguard`; `systemctl enable --now docker`.
 3. Собрать и запустить: `cd /root/wg-docker && ./up.sh`.
 4. Применить хост-настройки: `sysctl --system`, `nft -f /etc/nftables.conf`.
-5. Выпустить клиента: `docker exec wg gen-client.sh <имя>`.
+5. Ключи сервера создаются автоматически при первом запуске. Вручную / при
+   необходимости: `docker exec wg gen-server.sh` (`--force` — перегенерировать).
+6. Выпустить клиента: `docker exec wg gen-client.sh <имя>`.
 
 ## Обновление решения (централизованно)
 
