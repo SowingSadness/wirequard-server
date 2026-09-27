@@ -19,6 +19,7 @@ deja-wg/
 │   ├── entrypoint.sh       # поднимает wg0 (kernel) + unbound
 │   ├── gen-server.sh       # генерация ключей сервера (идемпотентно)
 │   ├── gen-client.sh       # генератор клиентов
+│   ├── show-client.sh      # вывод актуального конфига клиента (ini/xray/both)
 │   ├── unbound.conf.default
 │   ├── up.sh               # сборка + запуск с усиленными флагами
 │   └── config/
@@ -43,7 +44,7 @@ deja-wg/
 Все они создаются автоматически:
 - `gen-server.sh` — ключи сервера и `wg0.conf` (вызывается из `entrypoint.sh`);
 - `entrypoint.sh` — поднимает `wg0` и генерирует `unbound.conf`;
-- `gen-client.sh` — ключи клиента, PSK и `<имя>.conf`.
+- `gen-client.sh` — ключи клиента, PSK и `<имя>.conf` (Xray — только с `--format`).
 
 ## Развёртывание на новом сервере
 
@@ -60,7 +61,8 @@ deja-wg/
 4. Применить хост-настройки: `sysctl --system`, `nft -f /etc/nftables.conf`.
 5. Ключи сервера создаются автоматически при первом запуске. Вручную / при
    необходимости: `docker exec wg gen-server.sh` (`--force` — перегенерировать).
-6. Выпустить клиента: `docker exec wg gen-client.sh <имя>`.
+6. Выпустить клиента: `docker exec wg gen-client.sh <имя>` (по умолчанию — сводка).
+   Конфиг: `docker exec wg show-client.sh <имя> --format ini|xray|both`.
 
 ## Обновление решения (централизованно)
 

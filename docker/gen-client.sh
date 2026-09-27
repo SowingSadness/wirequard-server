@@ -1,31 +1,48 @@
 #!/usr/bin/env bash
 #
-# gen-client.sh <name> — выпускает нового клиента:
-#   * генерирует ключи и Preshared Key;
-#   * выделяет свободный адрес 10.8.0.X / fd42:8:8::X;
-#   * формирует клиентский .conf (AllowedIPs из /config/allowed-ips.list);
-#   * дописывает [Peer] в wg0.conf и применяет через wg syncconf (без разрыва).
+# gen-client.sh <имя> [--format ini|xray|both] [--qr]
+#
+# Выпускает нового клиента: ключи, Preshared Key, свободный адрес, peer и
+# применение через `wg syncconf` (без разрыва сессий).
+#
+# Поведение вывода:
+#   * без --format  -> печатает СВОДКУ для ручной настройки (адрес, DNS, MTU,
+#                      endpoint, server pub, пути к файлам);
+#   * с --format    -> печатает конфиг в заданном формате (ini / xray / both).
+# Конфиг Xray сохраняется на диск ТОЛЬКО если --format включает xray.
+# INI-конфиг (<имя>.conf) сохраняется всегда.
+#
+# Логика рендеринга берётся из show-client.sh (source) — без дублирования.
 #
 set -euo pipefail
 umask 077
 
 CONFIG="${CONFIG_DIR:-/config}"
 PORT="${WG_PORT:-38471}"
-name="${1:-}"
-if [ -z "$name" ]; then
-  echo "Использование: gen-client.sh <name>" >&2
-  exit 1
-fi
-if ! [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
-  echo "Недопустимое имя (разрешены A-Z a-z 0-9 _ -): $name" >&2
-  exit 1
+
+# shellcheck source=/dev/null
+source /usr/local/bin/show-client.sh
+
+usage() { echo "Использование: gen-client.sh <имя> [--format ini|xray|both] [--qr]" >&2; }
+
+name=""; format=""; qr=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --format) format="${2:-}"; shift 2 ;;
+    --qr)     qr=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "Неизвестный аргумент: $1" >&2; usage; exit 1 ;;
+    *)  name="$1"; shift ;;
+  esac
+done
+[ -n "$name" ] || { usage; exit 1; }
+[[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Недопустимое имя: $name" >&2; exit 1; }
+if [ -n "$format" ]; then
+  case "$format" in ini|xray|both) ;; *) echo "format должен быть ini|xray|both" >&2; exit 1 ;; esac
 fi
 
 cdir="$CONFIG/clients/$name"
-if [ -d "$cdir" ]; then
-  echo "Клиент '$name' уже существует: $cdir" >&2
-  exit 1
-fi
+[ -d "$cdir" ] && { echo "Клиент '$name' уже существует: $cdir" >&2; exit 1; }
 mkdir -p "$cdir"
 
 # --- ключи -------------------------------------------------------------------
@@ -40,9 +57,7 @@ used="$(awk -F'[=,/ ]+' '
       if ($i ~ /^10\.8\.0\.[0-9]+$/) { split($i,a,"."); print a[4] } }
 ' "$CONFIG/wg0.conf" 2>/dev/null | sort -n | uniq || true)"
 idx=2
-while printf '%s\n' "$used" | grep -qx "$idx"; do
-  idx=$((idx + 1))
-done
+while printf '%s\n' "$used" | grep -qx "$idx"; do idx=$((idx + 1)); done
 
 # --- peer в серверный конфиг -------------------------------------------------
 cat >> "$CONFIG/wg0.conf" <<EOF
@@ -54,51 +69,43 @@ PresharedKey = $(cat "$cdir/psk.key")
 AllowedIPs = 10.8.0.$idx/32, fd42:8:8::$idx/128
 EOF
 
-# --- AllowedIPs клиента из allowed-ips.list ----------------------------------
-allowed=""
-if [ -f "$CONFIG/allowed-ips.list" ]; then
-  while IFS= read -r line || [ -n "$line" ]; do
-    line="${line%%#*}"
-    line="$(printf '%s' "$line" | tr -d '[:space:]')"
-    [ -z "$line" ] && continue
-    allowed="$allowed, $line"
-  done < "$CONFIG/allowed-ips.list"
-fi
-# VPN-подсети добавляем всегда (нужны для DNS и шлюза)
-allowed="10.8.0.0/24, fd42:8:8::/64${allowed}"
-
-endpoint="$(cat "$CONFIG/endpoint" 2>/dev/null || echo "REPLACE_WITH_SERVER_IP:$PORT")"
-
-# --- клиентский конфиг -------------------------------------------------------
-conf="$cdir/$name.conf"
-cat > "$conf" <<EOF
-[Interface]
-PrivateKey = $(cat "$cdir/priv.key")
-Address = 10.8.0.$idx/24, fd42:8:8::$idx/64
-DNS = 10.8.0.1, fd42:8:8::1
-MTU = 1420
-
-[Peer]
-PublicKey = $(cat "$CONFIG/server.pub")
-PresharedKey = $(cat "$cdir/psk.key")
-Endpoint = $endpoint
-AllowedIPs =$allowed
-PersistentKeepalive = 25
-EOF
-chmod 600 "$conf"
-
-# --- применяем на сервере без разрыва существующих сессий --------------------
+# --- применяем без разрыва существующих сессий -------------------------------
 if wg show wg0 >/dev/null 2>&1; then
   wg syncconf wg0 <(grep -v '^#' "$CONFIG/wg0.conf")
 fi
 
-# --- QR ----------------------------------------------------------------------
-qrencode -t ansiutf8 < "$conf" > "$cdir/$name.qr.txt" 2>/dev/null || true
-qrencode -o "$cdir/$name.png" < "$conf" 2>/dev/null || true
+# --- конфиги: INI всегда; Xray — только если формат его включает -------------
+conf_path="$(save_ini "$name")"
+xray_path=""
+case "$format" in
+  xray|both) xray_path="$(save_xray "$name")" ;;
+esac
 
-echo "Клиент '$name' создан:"
-echo "  адрес:    10.8.0.$idx, fd42:8:8::$idx"
-echo "  конфиг:   $conf"
-[ -f "$cdir/$name.png" ] && echo "  QR (png): $cdir/$name.png"
-echo
-cat "$cdir/$name.qr.txt" 2>/dev/null || true
+# --- вывод -------------------------------------------------------------------
+if [ -z "$format" ]; then
+  echo "Клиент '$name' создан."
+  echo "  адрес:       10.8.0.$idx, fd42:8:8::$idx"
+  echo "  DNS:         10.8.0.1, fd42:8:8::1"
+  echo "  MTU:         1420"
+  echo "  endpoint:    $(endpoint)"
+  echo "  server pub:  $(server_pub)"
+  echo "  INI конфиг:  $conf_path"
+  [ -n "$xray_path" ] && echo "  Xray конфиг: $xray_path"
+  echo
+  echo "Показать конфиг: docker exec wg show-client.sh $name --format ini|xray|both"
+else
+  case "$format" in
+    ini)  render_ini "$name" ;;
+    xray) render_xray "$name" ;;
+    both)
+      echo "===== WireGuard (INI) ====="
+      render_ini "$name"
+      echo
+      echo "===== Xray-core (JSON) ====="
+      render_xray "$name"
+      ;;
+  esac
+fi
+
+if [ "$qr" -eq 1 ]; then print_qr "$name"; fi
+exit 0

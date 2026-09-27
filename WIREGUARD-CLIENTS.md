@@ -59,23 +59,47 @@ PersistentKeepalive = 25
 docker exec wg gen-client.sh <имя-клиента>
 ```
 
+По умолчанию печатается **сводка для ручной настройки** (адрес, DNS, MTU,
+endpoint, публичный ключ сервера, пути к файлам). Конфиг выводится сразу, если
+указать формат:
+
+```bash
+docker exec wg gen-client.sh <имя> --format both    # ini + xray
+docker exec wg gen-client.sh <имя> --format ini     # только WireGuard .conf
+docker exec wg gen-client.sh <имя> --format xray    # сохранит <имя>.xray.json
+```
+
 Правила имени: `A–Z a–z 0–9 _ -`. Пример:
 ```bash
-docker exec wg gen-client.sh laptop
+docker exec wg gen-client.sh laptop --format both
 ```
 
 Что появится:
 ```
 /root/wg-docker/config/clients/<имя>/
-├── <имя>.conf     # готовый конфиг для устройства
-├── priv.key       # приватный ключ
-├── pub.key        # публичный ключ
-└── psk.key        # Preshared Key
+├── <имя>.conf        # конфиг WireGuard (сохраняется всегда)
+├── <имя>.xray.json   # конфиг Xray (только если --format включает xray)
+├── priv.key          # приватный ключ
+├── pub.key           # публичный ключ
+└── psk.key           # Preshared Key
 ```
 Серверный peer при этом добавляется в `config/wg0.conf` и применяется
 (`wg syncconf`), поэтому перезапуск контейнера не нужен.
 
 Адреса выдаются последовательно: `10.8.0.2`, `10.8.0.3`, … и `fd42:8:8::2`, `::3`, …
+
+### Показать актуальный конфиг клиента
+`show-client.sh` пересобирает конфиг из ключей клиента, `server.pub`, `endpoint`
+и **текущего** `allowed-ips.list` (то есть отражает последние изменения списка):
+
+```bash
+docker exec wg show-client.sh <имя> --format ini      # WireGuard .conf
+docker exec wg show-client.sh <имя> --format xray     # Xray JSON
+docker exec wg show-client.sh <имя> --format both      # оба
+docker exec wg show-client.sh <имя> --format ini --qr  # + QR (нужен qrencode)
+```
+`show-client.sh` ничего не меняет на сервере; при `--save` дополнительно
+обновляет файлы `<имя>.conf` / `<имя>.xray.json`.
 
 ---
 
@@ -128,6 +152,9 @@ qrencode -o <имя>.png < <имя>.conf     # файл-картинка
 ---
 
 ## 4.1. Клиент Xray-core (WireGuard outbound)
+
+> Готовый конфиг можно получить автоматически:
+> `docker exec wg show-client.sh <имя> --format xray` (или `--format both`).
 
 Xray-core (v1.8.6+) умеет WireGuard как **userspace-outbound**. Это и есть
 «режим прокси»: Xray поднимает локальный SOCKS/HTTP, а в туннель уходит только
@@ -330,8 +357,13 @@ docker logs -f wg | grep -Ei 'query|reply'
 ## 9. Справочник команд (на сервере)
 
 ```bash
-# выпустить нового клиента
+# выпустить нового клиента (по умолчанию — сводка)
 docker exec wg gen-client.sh <имя>
+docker exec wg gen-client.sh <имя> --format both   # сразу вывести ini+xray
+
+# показать актуальный конфиг существующего клиента
+docker exec wg show-client.sh <имя> --format ini|xray|both
+docker exec wg show-client.sh <имя> --format ini --qr   # + QR (нужен qrencode)
 
 # ключи сервера: создать/поддерживать wg0.conf (идемпотентно, клиенты сохраняются)
 docker exec wg gen-server.sh

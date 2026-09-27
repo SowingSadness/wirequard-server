@@ -13,8 +13,9 @@ RUN apk add --no-cache \
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY gen-client.sh /usr/local/bin/gen-client.sh
 COPY gen-server.sh /usr/local/bin/gen-server.sh
+COPY show-client.sh /usr/local/bin/show-client.sh
 COPY unbound.conf.default /usr/local/share/unbound.conf.default
-RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/gen-client.sh /usr/local/bin/gen-server.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/gen-client.sh /usr/local/bin/gen-server.sh /usr/local/bin/show-client.sh
 
 VOLUME ["/config"]
 EXPOSE 38471/udp
