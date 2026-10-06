@@ -20,7 +20,7 @@ deja-wg/
 │   ├── entrypoint.sh       # поднимает wg0 (kernel) + unbound
 │   ├── gen-server.sh       # генерация ключей сервера (идемпотентно)
 │   ├── gen-client.sh       # генератор клиентов
-│   ├── show-client.sh      # вывод актуального конфига клиента (ini/xray/both)
+│   ├── show-client.sh      # вывод актуального конфига клиента (ini/xray/both/link)
 │   ├── unbound.conf.default
 │   ├── up.sh               # сборка + запуск с усиленными флагами
 │   └── config/
@@ -78,7 +78,8 @@ cd wirequard-server
 5. Ключи сервера создаются автоматически при первом запуске. Вручную / при
    необходимости: `docker exec wg gen-server.sh` (`--force` — перегенерировать).
 6. Выпустить клиента: `docker exec wg gen-client.sh <имя>` (по умолчанию — сводка).
-   Конфиг: `docker exec wg show-client.sh <имя> --format ini|xray|both`.
+   Конфиг/ссылка: `docker exec wg show-client.sh <имя> --format ini|xray|both|link`
+   (`link` — самодостаточная ссылка `wireguard://` для Happ/sing-box).
 
 ## Обновление решения (централизованно)
 

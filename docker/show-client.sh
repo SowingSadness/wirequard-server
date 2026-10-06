@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
-# show-client.sh <имя> [--format ini|xray|both] [--save] [--qr]
+# show-client.sh <имя> [--format ini|xray|both|link] [--save] [--qr]
 #
 # Выводит АКТУАЛЬНЫЙ конфиг клиента (пересобирается из ключей клиента,
 # server.pub, endpoint и текущего allowed-ips.list):
 #   ini  — конфиг WireGuard (.conf)
 #   xray — конфиг Xray-core (JSON, WireGuard outbound)
-#   both — оба (по умолчанию ini)
+#   link — ссылка wireguard://... (Happ / sing-box): всё внутри, сервер не нужен
+#   both — ini + xray (по умолчанию ini)
 #
 # Скрипт можно подключать как библиотеку: `source show-client.sh` — тогда
 # доступны функции render_ini / render_xray / save_ini / save_xray / print_qr
@@ -166,6 +167,26 @@ save_xray() {      # <имя> -> путь
   printf '%s' "$d/$name.xray.json"
 }
 
+save_link() {      # <имя> -> путь  (deep-link wireguard:// для Happ/sing-box)
+  local name="$1" d="$CONFIG/clients/$name"
+  mkdir -p "$d"
+  render_link "$name" > "$d/$name.link.txt"
+  chmod 600 "$d/$name.link.txt"
+  printf '%s' "$d/$name.link.txt"
+}
+
+render_link() {    # <имя> -> wireguard:// URI (Happ / sing-box style)
+  local name="$1" idx priv psk ep host port
+  idx="$(client_index "$name")"
+  priv="$(client_field "$name" priv)"
+  psk="$(client_field "$name" psk)"
+  ep="$(endpoint)"
+  host="${ep%:*}"; port="${ep##*:}"
+  printf 'wireguard://%s@%s:%s?publickey=%s&address=%s,%s&mtu=1420&presharedkey=%s#%s\n' \
+    "$priv" "$host" "$port" "$(server_pub)" \
+    "10.8.0.$idx/32" "fd42:8:8::$idx/128" "$psk" "$name"
+}
+
 print_qr() {       # <имя> (только INI)
   local name="$1" d="$CONFIG/clients/$name"
   [ -s "$d/$name.conf" ] || save_ini "$name" >/dev/null
@@ -179,7 +200,7 @@ print_qr() {       # <имя> (только INI)
 
 main() {
   local name="${1:-}"; [ $# -gt 0 ] && shift
-  [ -n "$name" ] || die "Использование: show-client.sh <имя> [--format ini|xray|both] [--save] [--qr]"
+  [ -n "$name" ] || die "Использование: show-client.sh <имя> [--format ini|xray|both|link] [--save] [--qr]"
 
   local format="ini" save=0 qr=0
   while [ $# -gt 0 ]; do
@@ -190,16 +211,18 @@ main() {
       *) die "неизвестный аргумент: $1" ;;
     esac
   done
-  case "$format" in ini|xray|both) ;; *) die "format должен быть ini|xray|both" ;; esac
+  case "$format" in ini|xray|both|link) ;; *) die "format должен быть ini|xray|both|link" ;; esac
 
   if [ "$save" -eq 1 ]; then
-    case "$format" in ini|both) save_ini  "$name" >/dev/null ;; esac
+    case "$format" in ini|both)  save_ini  "$name" >/dev/null ;; esac
     case "$format" in xray|both) save_xray "$name" >/dev/null ;; esac
+    case "$format" in link)      save_link "$name" >/dev/null ;; esac
   fi
 
   case "$format" in
     ini)  render_ini "$name" ;;
     xray) render_xray "$name" ;;
+    link) render_link "$name" ;;
     both)
       echo "===== WireGuard (INI) ====="
       render_ini "$name"

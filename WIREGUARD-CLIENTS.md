@@ -95,11 +95,23 @@ docker exec wg gen-client.sh laptop --format both
 ```bash
 docker exec wg show-client.sh <имя> --format ini      # WireGuard .conf
 docker exec wg show-client.sh <имя> --format xray     # Xray JSON
-docker exec wg show-client.sh <имя> --format both      # оба
+docker exec wg show-client.sh <имя> --format link     # ссылка wireguard:// (Happ/sing-box)
+docker exec wg show-client.sh <имя> --format both      # ini + xray
 docker exec wg show-client.sh <имя> --format ini --qr  # + QR (нужен qrencode)
 ```
 `show-client.sh` ничего не меняет на сервере; при `--save` дополнительно
-обновляет файлы `<имя>.conf` / `<имя>.xray.json`.
+обновляет файлы `<имя>.conf` / `<имя>.xray.json` / `<имя>.link.txt`.
+
+#### Ссылка `--format link` (Happ / sing-box)
+Формируется самодостаточная ссылка `wireguard://`, в которой уже есть все данные
+(ключи, адрес, endpoint, PSK) — клиент **не обращается к серверу**:
+
+```
+wireguard://<PrivateKey>@<host>:<port>?publickey=<ServerPublicKey>&address=<IPv4>/32,<IPv6>/128&mtu=1420&presharedkey=<PSK>#<имя>
+```
+Её можно вставить в телефон (Happ/V2rayTun и совместимые клиенты) или сгенерировать
+из неё QR. Параметры: `publickey`, `address`, `mtu`, `presharedkey`, заголовок после `#`.
+(Параметр `reserved` не используется — он только для Cloudflare WARP.)
 
 ---
 
@@ -362,8 +374,9 @@ docker exec wg gen-client.sh <имя>
 docker exec wg gen-client.sh <имя> --format both   # сразу вывести ini+xray
 
 # показать актуальный конфиг существующего клиента
-docker exec wg show-client.sh <имя> --format ini|xray|both
-docker exec wg show-client.sh <имя> --format ini --qr   # + QR (нужен qrencode)
+docker exec wg show-client.sh <имя> --format ini|xray|both|link
+docker exec wg show-client.sh <имя> --format link        # ссылка wireguard:// для Happ
+docker exec wg show-client.sh <имя> --format ini --qr    # + QR (нужен qrencode)
 
 # ключи сервера: создать/поддерживать wg0.conf (идемпотентно, клиенты сохраняются)
 docker exec wg gen-server.sh

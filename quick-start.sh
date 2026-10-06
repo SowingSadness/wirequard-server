@@ -180,8 +180,9 @@ cat <<EOF
  КАК ДОБАВИТЬ КЛИЕНТА:
    docker exec ${CONTAINER} gen-client.sh <имя> --format both
 
- Показать актуальный конфиг клиента:
+ Показать конфиг/ссылку клиента:
    docker exec ${CONTAINER} show-client.sh <имя> --format both
+   docker exec ${CONTAINER} show-client.sh <имя> --format link   # wireguard:// для Happ
 
  Скачать QR-картинку клиента (если генерировали с --qr):
    scp -P ${SSH_PORT} root@${PUB_IP}:${WG_DIR}/config/clients/<имя>/<имя>.png .

@@ -336,7 +336,7 @@ cat "$CONFIG/server.pub"
 ----- gen-client.sh -----
 #!/usr/bin/env bash
 #
-# gen-client.sh <имя> [--format ini|xray|both] [--qr]
+# gen-client.sh <имя> [--format ini|xray|both|link] [--qr]
 #
 # Выпускает нового клиента: ключи, Preshared Key, свободный адрес, peer и
 # применение через `wg syncconf` (без разрыва сессий).
@@ -344,8 +344,9 @@ cat "$CONFIG/server.pub"
 # Поведение вывода:
 #   * без --format  -> печатает СВОДКУ для ручной настройки (адрес, DNS, MTU,
 #                      endpoint, server pub, пути к файлам);
-#   * с --format    -> печатает конфиг в заданном формате (ini / xray / both).
-# Конфиг Xray сохраняется на диск ТОЛЬКО если --format включает xray.
+#   * с --format    -> печатает конфиг в заданном формате (ini / xray / both / link).
+# Конфиг Xray сохраняется на диск ТОЛЬКО если --format включает xray,
+# ссылка link — только если --format = link.
 # INI-конфиг (<имя>.conf) сохраняется всегда.
 #
 # Логика рендеринга берётся из show-client.sh (source) — без дублирования.
@@ -359,7 +360,7 @@ PORT="${WG_PORT:-38471}"
 # shellcheck source=/dev/null
 source /usr/local/bin/show-client.sh
 
-usage() { echo "Использование: gen-client.sh <имя> [--format ini|xray|both] [--qr]" >&2; }
+usage() { echo "Использование: gen-client.sh <имя> [--format ini|xray|both|link] [--qr]" >&2; }
 
 name=""; format=""; qr=0
 while [ $# -gt 0 ]; do
@@ -374,7 +375,7 @@ done
 [ -n "$name" ] || { usage; exit 1; }
 [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Недопустимое имя: $name" >&2; exit 1; }
 if [ -n "$format" ]; then
-  case "$format" in ini|xray|both) ;; *) echo "format должен быть ini|xray|both" >&2; exit 1 ;; esac
+  case "$format" in ini|xray|both|link) ;; *) echo "format должен быть ini|xray|both|link" >&2; exit 1 ;; esac
 fi
 
 cdir="$CONFIG/clients/$name"
@@ -414,8 +415,12 @@ fi
 # --- конфиги: INI всегда; Xray — только если формат его включает -------------
 conf_path="$(save_ini "$name")"
 xray_path=""
+link_path=""
 case "$format" in
   xray|both) xray_path="$(save_xray "$name")" ;;
+esac
+case "$format" in
+  link) link_path="$(save_link "$name")" ;;
 esac
 
 # --- вывод -------------------------------------------------------------------
@@ -428,12 +433,14 @@ if [ -z "$format" ]; then
   echo "  server pub:  $(server_pub)"
   echo "  INI конфиг:  $conf_path"
   [ -n "$xray_path" ] && echo "  Xray конфиг: $xray_path"
+  [ -n "$link_path" ] && echo "  Ссылка:      $link_path"
   echo
-  echo "Показать конфиг: docker exec wg show-client.sh $name --format ini|xray|both"
+  echo "Показать конфиг: docker exec wg show-client.sh $name --format ini|xray|both|link"
 else
   case "$format" in
     ini)  render_ini "$name" ;;
     xray) render_xray "$name" ;;
+    link) render_link "$name" ;;
     both)
       echo "===== WireGuard (INI) ====="
       render_ini "$name"
@@ -450,13 +457,14 @@ exit 0
 ----- show-client.sh -----
 #!/usr/bin/env bash
 #
-# show-client.sh <имя> [--format ini|xray|both] [--save] [--qr]
+# show-client.sh <имя> [--format ini|xray|both|link] [--save] [--qr]
 #
 # Выводит АКТУАЛЬНЫЙ конфиг клиента (пересобирается из ключей клиента,
 # server.pub, endpoint и текущего allowed-ips.list):
 #   ini  — конфиг WireGuard (.conf)
 #   xray — конфиг Xray-core (JSON, WireGuard outbound)
-#   both — оба (по умолчанию ini)
+#   link — ссылка wireguard://... (Happ / sing-box): всё внутри, сервер не нужен
+#   both — ini + xray (по умолчанию ini)
 #
 # Скрипт можно подключать как библиотеку: `source show-client.sh` — тогда
 # доступны функции render_ini / render_xray / save_ini / save_xray / print_qr
@@ -616,6 +624,27 @@ save_xray() {      # <имя> -> путь
   printf '%s' "$d/$name.xray.json"
 }
 
+save_link() {      # <имя> -> путь  (deep-link wireguard:// для Happ/sing-box)
+  local name="$1" d="$CONFIG/clients/$name"
+  mkdir -p "$d"
+  render_link "$name" > "$d/$name.link.txt"
+  chmod 600 "$d/$name.link.txt"
+  printf '%s' "$d/$name.link.txt"
+}
+
+render_link() {    # <имя> -> wireguard:// URI (Happ / sing-box style)
+  local name="$1" idx priv psk ep host port
+  idx="$(client_index "$name")"
+  priv="$(client_field "$name" priv)"
+  psk="$(client_field "$name" psk)"
+  ep="$(endpoint)"
+  host="${ep%:*}"; port="${ep##*:}"
+  printf 'wireguard://%s@%s:%s?publickey=%s&address=%s,%s&mtu=1420&presharedkey=%s#%s
+' \
+    "$priv" "$host" "$port" "$(server_pub)" \
+    "10.8.0.$idx/32" "fd42:8:8::$idx/128" "$psk" "$name"
+}
+
 print_qr() {       # <имя> (только INI)
   local name="$1" d="$CONFIG/clients/$name"
   [ -s "$d/$name.conf" ] || save_ini "$name" >/dev/null
@@ -629,7 +658,7 @@ print_qr() {       # <имя> (только INI)
 
 main() {
   local name="${1:-}"; [ $# -gt 0 ] && shift
-  [ -n "$name" ] || die "Использование: show-client.sh <имя> [--format ini|xray|both] [--save] [--qr]"
+  [ -n "$name" ] || die "Использование: show-client.sh <имя> [--format ini|xray|both|link] [--save] [--qr]"
 
   local format="ini" save=0 qr=0
   while [ $# -gt 0 ]; do
@@ -640,16 +669,18 @@ main() {
       *) die "неизвестный аргумент: $1" ;;
     esac
   done
-  case "$format" in ini|xray|both) ;; *) die "format должен быть ini|xray|both" ;; esac
+  case "$format" in ini|xray|both|link) ;; *) die "format должен быть ini|xray|both|link" ;; esac
 
   if [ "$save" -eq 1 ]; then
-    case "$format" in ini|both) save_ini  "$name" >/dev/null ;; esac
+    case "$format" in ini|both)  save_ini  "$name" >/dev/null ;; esac
     case "$format" in xray|both) save_xray "$name" >/dev/null ;; esac
+    case "$format" in link)      save_link "$name" >/dev/null ;; esac
   fi
 
   case "$format" in
     ini)  render_ini "$name" ;;
     xray) render_xray "$name" ;;
+    link) render_link "$name" ;;
     both)
       echo "===== WireGuard (INI) ====="
       render_ini "$name"
@@ -840,12 +871,14 @@ docker logs "$CONTAINER" 2>&1 | tail -8
     # сразу вывести конфиг в нужном формате (ini | xray | both)
     docker exec wg gen-client.sh <имя> --format both
     docker exec wg gen-client.sh <имя> --format xray   # сохранит <имя>.xray.json
+    docker exec wg gen-client.sh <имя> --format link   # ссылка wireguard:// (Happ)
 
     # показать АКТУАЛЬНЫЙ конфиг уже существующего клиента
     # (пересобирается из ключей, server.pub, endpoint и текущего allowed-ips.list)
     docker exec wg show-client.sh <имя> --format ini
     docker exec wg show-client.sh <имя> --format xray
     docker exec wg show-client.sh <имя> --format both
+    docker exec wg show-client.sh <имя> --format link      # wireguard:// для Happ/sing-box
     docker exec wg show-client.sh <имя> --format ini --qr   # + QR (если есть qrencode)
 
 Peer автоматически добавляется в сервер и применяется (wg syncconf).
